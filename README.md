@@ -1,10 +1,10 @@
-# PQMT
-PQMT: Position-aware Network and Qualifier-Interactive Attention for Multi-Task Hyper-Relation Extraction
+# BTMC
+BTMC：Hyper-Relation Extraction via  BiTime-LSTM and Multi-Relation Contrastive Learning
 
 ## Overview
-![](./figs/F0.drawio.png)
-![](./figs/F1.drawio.png)
-![](./figs/F2.drawio.png)
+![](./figs/F1.png)
+![](./figs/F2.png)
+![](./figs/F3.png)
 
 
 
