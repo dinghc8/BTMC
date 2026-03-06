@@ -2,9 +2,8 @@
 BTMC：Hyper-Relation Extraction via  BiTime-LSTM and Multi-Relation Contrastive Learning
 
 ## Overview
-![](./figs/F1.png)
-![](./figs/F2.png)
-![](./figs/F3.png)
+![](./figs/1.png)
+![](./figs/2.png)
 
 
 
