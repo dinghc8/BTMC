@@ -1476,7 +1476,6 @@ def compaction(res_set, result_comp_file):
 
     for res_line in res_set:
         res_comp_line = []
-        #用 map 将主三元组相同的超关系归到一类
         hy_map = {}
         for index in range(res_line.__len__()):
             res_dict = json.loads(res_line[index])
@@ -1548,7 +1547,7 @@ def statistic(res_table, test_file):
             num_label += 1
             text_label_relations.append(json.dumps(text_label_relation))
 
-        # 在同一个段落里作比较
+        
         for res_hr in res_list:
             num_result += 1
             for label_hr in text_label_relations:
@@ -1612,7 +1611,7 @@ def main():
                             ALL_MODELS))  # "bert_models/bert-base-uncased",    !!!! "bert_models/bert-large-uncased"
     ##################################################################################################
     # select-seed s
-    parser.add_argument('--seed', type=int, default=42,
+    parser.add_argument('--seed', type=int, default=44,
                         help="random seed for initialization")  # 42,43,44,45,46
     ##################################################################################################
     # select-(alpha,q_alpha) a
