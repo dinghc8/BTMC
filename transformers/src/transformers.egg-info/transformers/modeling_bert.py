@@ -2136,8 +2136,6 @@ class BertForACEBothSub(BertPreTrainedModel):
         return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
 
 
-
-
 class BertForACEBothOneDropoutSpanSub(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -2219,151 +2217,73 @@ class BertForACEBothOneDropoutSpanSub(BertPreTrainedModel):
         return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
 
 
+import torch
+import torch.nn as nn
+import math
 
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
 
+def apply_rope(x, cos, sin):
 
-class PosiNet(nn.Module):
+    while cos.ndim < x.ndim - 1:
+        cos = cos.unsqueeze(0)
+    while sin.ndim < x.ndim - 1:
+        sin = sin.unsqueeze(0)
+    return x * cos + rotate_half(x) * sin
 
-    def __init__(self, d_model, n=49, simple=False):
+class HOPE_Adapted(nn.Module):
 
-        super(PosiNet, self).__init__()
-        self.fc_q = nn.Linear(d_model, d_model)
-        self.fc_k = nn.Linear(d_model, d_model)
-        self.fc_v = nn.Linear(d_model, d_model)
-        if (simple):
-            self.position_biases = torch.zeros((n, n))
-        else:
-            self.position_biases = nn.Parameter(torch.ones((n, n)))
-        self.d_model = d_model
-        self.n = n
-        self.sigmoid = nn.Sigmoid()
-
-        self.init_weights()
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                init.constant_(m.weight, 1)
-                init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-
-    def forward(self, input):
-
-        bs, n, dim = input.shape
-
-        q = self.fc_q(input)  # bs,n,dim
-        k = self.fc_k(input).view(1, bs, n, dim)  # 1,bs,n,dim
-        v = self.fc_v(input).view(1, bs, n, dim)  # 1,bs,n,dim
-
-        numerator = torch.sum(torch.exp(k + self.position_biases.view(n, 1, -1, 1)) * v, dim=2)  # n,bs,dim
-        denominator = torch.sum(torch.exp(k + self.position_biases.view(n, 1, -1, 1)), dim=2)  # n,bs,dim
-
-        out = (numerator / denominator)  # n,bs,dim
-        out = self.sigmoid(q) * (out.permute(1, 0, 2))  # bs,n,dim
-
-        return out
-
-
-class Depth_Pointwise_Conv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, k):
+    def __init__(self, total_dim: int, num_heads: int, base: int = 10000, max_seq_len: int = 8192, train_seq_len: int = 512):
         super().__init__()
-        if (k == 1):
-            self.depth_conv = nn.Identity()
+        self.total_dim = total_dim
+        self.num_heads = num_heads
+        self.head_dim = total_dim // num_heads
+        self.base = base
+        self.max_seq_len = max_seq_len
+        self.train_seq_len = train_seq_len
+        self.d_half = self.head_dim // 2
+        theta = 1.0 / (base ** (torch.arange(0, self.d_half, dtype=torch.float32) / self.d_half))
+        freq_threshold = math.pi / self.train_seq_len
+        num_rotated_pairs = torch.sum(theta > freq_threshold).item()
+        self.num_rotated_pairs = max(1, min(self.d_half, num_rotated_pairs))
+        self.rotated_head_dim = 2 * self.num_rotated_pairs
+        m = torch.arange(max_seq_len)
+        freqs_rotated = theta[:self.num_rotated_pairs]
+        angles = m[:, None] * freqs_rotated[None, :]
+        # This creates angles for dimensions 0 to rotated_head_dim-1
+        emb = torch.cat([angles, angles], dim=-1) # shape (max_seq_len, rotated_head_dim)
+
+        self.register_buffer('cos_cached', emb.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer('sin_cached', emb.sin().unsqueeze(0).unsqueeze(0))
+
+    def forward(self, x: torch.Tensor):
+        batch_size, seq_len, total_dim = x.shape
+        # 处理序列长度超过预计算最大长度的情况
+        if seq_len > self.max_seq_len:
+            print(f"Warning: seq_len ({seq_len}) > max_seq_len ({self.max_seq_len}). Truncating cached cos/sin.")
+            cos = self.cos_cached[:, :, :self.max_seq_len, :self.rotated_head_dim]
+            sin = self.sin_cached[:, :, :self.max_seq_len, :self.rotated_head_dim]
+            current_cos = cos[:, :, :seq_len, :]
+            current_sin = sin[:, :, :seq_len, :]
         else:
-            self.depth_conv = nn.Conv1d(
-                in_channels=in_ch,
-                out_channels=in_ch,
-                kernel_size=k,
-                groups=in_ch,
-                padding=k // 2
-            )
-        self.pointwise_conv = nn.Conv1d(
-            in_channels=in_ch,
-            out_channels=out_ch,
-            kernel_size=1,
-            groups=1
-        )
-
-    def forward(self, x):
-        out = self.pointwise_conv(self.depth_conv(x))
-        return out
-
-class qiaAttention(nn.Module):
-
-    def __init__(self, d_model, d_k, d_v, h, dropout=.1):
-
-        super(qiaAttention, self).__init__()
-        self.fc_q = nn.Linear(d_model, h * d_k)
-        self.fc_k = nn.Linear(d_model, h * d_k)
-        self.fc_v = nn.Linear(d_model, h * d_v)
-        self.fc_o = nn.Linear(h * d_v, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-        self.conv1 = Depth_Pointwise_Conv1d(h * d_v, d_model, 1)
-        self.conv3 = Depth_Pointwise_Conv1d(h * d_v, d_model, 3)
-        self.conv5 = Depth_Pointwise_Conv1d(h * d_v, d_model, 5)
-        self.dy_paras = nn.Parameter(torch.ones(3))
-        self.softmax = nn.Softmax(-1)
-
-        self.d_model = d_model
-        self.d_k = d_k
-        self.d_v = d_v
-        self.h = h
-
-        self.init_weights()
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                init.constant_(m.weight, 1)
-                init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-
-    def forward(self, queries, keys, values, attention_mask=None, attention_weights=None):
-
-        # Self Attention
-        b_s, nq = queries.shape[:2]
-        nk = keys.shape[1]
-
-        q = self.fc_q(queries).view(b_s, nq, self.h, self.d_k).permute(0, 2, 1, 3)  # (b_s, h, nq, d_k)
-        k = self.fc_k(keys).view(b_s, nk, self.h, self.d_k).permute(0, 2, 3, 1)  # (b_s, h, d_k, nk)
-        v = self.fc_v(values).view(b_s, nk, self.h, self.d_v).permute(0, 2, 1, 3)  # (b_s, h, nk, d_v)
-
-        att = torch.matmul(q, k) / np.sqrt(self.d_k)  # (b_s, h, nq, nk)
-        if attention_weights is not None:
-            att = att * attention_weights
-        if attention_mask is not None:
-            att = att.masked_fill(attention_mask, -np.inf)
-        att = torch.softmax(att, -1)
-        att = self.dropout(att)
-
-        out = torch.matmul(att, v).permute(0, 2, 1, 3).contiguous().view(b_s, nq, self.h * self.d_v)  # (b_s, nq, h*d_v)
-        out = self.fc_o(out)  # (b_s, nq, d_model)
-
-        v2 = v.permute(0, 1, 3, 2).contiguous().view(b_s, -1, nk)  # bs,dim,n
-        self.dy_paras = nn.Parameter(self.softmax(self.dy_paras))
-        out2 = self.dy_paras[0] * self.conv1(v2) + self.dy_paras[1] * self.conv3(v2) + self.dy_paras[2] * self.conv5(v2)
-        out2 = out2.permute(0, 2, 1)  # bs.n.dim
-
-        out = out + out2
-        return out
+            current_cos = self.cos_cached[:, :, :seq_len, :self.rotated_head_dim]
+            current_sin = self.sin_cached[:, :, :seq_len, :self.rotated_head_dim]
+        x_reshaped = x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # 将输入分为需要旋转的部分和位置无关的部分
+        x_rotated = x_reshaped[:, :, :, :self.rotated_head_dim]
+        x_independent = x_reshaped[:, :, :, self.rotated_head_dim:]
+        # 只对旋转部分应用RoPE
+        x_rotated_pe = apply_rope(x_rotated, current_cos, current_sin)
+        # 合并旋转后的部分和位置无关部分
+        x_pe_reshaped = torch.cat([x_rotated_pe, x_independent], dim=-1)
+        x_pe = x_pe_reshaped.transpose(1, 2).contiguous().view(batch_size, seq_len, total_dim)
+        return x_pe
 
 
-class BertForACEBothOneDropoutSub(BertPreTrainedModel):
+#HOPE
+class BertForACEBothOneDropoutSubyy(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.max_seq_length = config.max_seq_length
@@ -2374,6 +2294,649 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
+        self.ner_classifier = nn.Linear(config.hidden_size*2, self.num_ner_labels)
+        self.re_classifier_m1 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.re_classifier_m2 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.re_classifier_m3 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.q_re_classifier_m1 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+        self.q_re_classifier_m2 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+        self.q_re_classifier_m3 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+
+        self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels-1), dtype=torch.float32)
+        self.ner_alpha = torch.tensor([config.alpha] + [1.0] * (self.num_ner_labels-1), dtype=torch.float32)
+        self.q_alpha = torch.tensor([config.q_alpha] + [1.0] * (self.num_q_labels-1), dtype=torch.float32)
+
+
+        self.init_weights()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        mentions=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        sub_positions=None,
+        labels=None,
+        ner_labels=None,
+        q_labels=None,
+        q_ner_labels=None,
+        q2_labels=None,
+        q3_labels=None
+    ):
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        seq_len = self.max_seq_length
+        bsz, tot_seq_len = input_ids.shape
+        ent_len = (tot_seq_len-seq_len) // 2
+
+        e1_hidden_states = hidden_states[:, seq_len:seq_len+ent_len]
+        e2_hidden_states = hidden_states[:, seq_len+ent_len: ]
+
+        feature_vector = torch.cat([e1_hidden_states, e2_hidden_states], dim=2)
+
+
+        ner_prediction_scores = self.ner_classifier(feature_vector)
+
+        # relation_feature
+        r_feature_vector = torch.stack(([feature_vector]*ent_len), dim=2)
+
+
+        # qualifier_feature
+        q_feature_vector = torch.stack(([feature_vector]*ent_len), dim=1)
+        q_ner_prediction_scores = self.ner_classifier(q_feature_vector)
+
+        m1_start_states = hidden_states[torch.arange(bsz), sub_positions[:, 0]]
+        m1_end_states = hidden_states[torch.arange(bsz), sub_positions[:, 1]]
+        m1_states = torch.cat([m1_start_states, m1_end_states], dim=-1)
+
+        # Calculate prediction scores
+        m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
+        m2_scores = self.re_classifier_m2(r_feature_vector) # bsz, ent_len, num_label
+        m3_scores = self.re_classifier_m3(q_feature_vector)
+        re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
+
+        q_m1_scores = self.q_re_classifier_m1(m1_states)  # bsz, num_label
+        q_m2_scores = self.q_re_classifier_m2(r_feature_vector) # bsz, ent_len, num_label
+        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)
+        q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
+
+        outputs = (re_prediction_scores, ner_prediction_scores, q_re_prediction_scores, q_ner_prediction_scores)
+
+        if labels is not None:
+            loss_fct_re = CrossEntropyLoss(ignore_index=-1,  weight=self.alpha.to(re_prediction_scores))
+            loss_fct_ner = CrossEntropyLoss(ignore_index=-1,  weight=self.ner_alpha.to(ner_prediction_scores))
+            loss_fct_q_re = CrossEntropyLoss(ignore_index=-1,  weight=self.q_alpha.to(q_re_prediction_scores))
+
+            re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
+            ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
+            q_re_loss = loss_fct_q_re(q_re_prediction_scores.view(-1, self.num_q_labels), q_labels.view(-1))
+            loss = re_loss + ner_loss + q_re_loss
+            outputs = (loss, re_loss, ner_loss, q_re_loss) + outputs
+
+        return outputs
+
+
+
+
+import torch.nn.functional as F
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BiLSTMSequenceFeatureExtractor(nn.Module):
+
+    def __init__(self, input_dim: int, output_dim: int, dropout_rate: float = 0.5):
+        """
+        初始化模型。
+
+        Args:
+            input_dim: 每个 token 输入特征的维度 (例如 1536)。
+            output_dim: 每个时间步输出特征的维度 (例如 1536)。
+                         为了满足 Bi-LSTM 输出形状要求，output_dim 必须是偶数。
+            dropout_rate: 应用于输入嵌入层的 dropout 比率 (论文中是 0.5)。
+        """
+        super(BiLSTMSequenceFeatureExtractor, self).__init__()
+
+        if output_dim % 2 != 0:
+            raise ValueError("output_dim must be an even number for Bi-LSTM output.")
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.dropout_rate = dropout_rate
+
+        # 计算 Bi-LSTM 的 hidden_size
+        self.hidden_dim = self.output_dim // 2 # 确保 Bi-LSTM 输出维度等于 output_dim
+
+        # 根据论文，dropout 应用于输入嵌入层
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # 双向 LSTM 层
+        # input_size 是每个时间步输入特征的维度 (即 input_dim)
+        # hidden_size 是 LSTM 隐藏状态的维度 (这里设置为 output_dim // 2)
+        # num_layers=1 是单层 Bi-LSTM
+        # bidirectional=True 表示双向
+        # batch_first=True 表示输入/输出张量形状是 (batch, sequence, feature)
+        self.lstm = nn.LSTM(input_size=self.input_dim,
+                            hidden_size=self.hidden_dim, # Bi-LSTM 的隐藏维度
+                            num_layers=1,
+                            bidirectional=True,
+                            batch_first=True)
+
+        # 注意：这里没有最后的分类层 (self.fc)，因为我们直接返回 LSTM 的序列输出
+
+    def forward(self, x):
+        """
+        模型的前向传播。
+
+        Args:
+            x: 输入张量，形状为 (batch_size, sequence_length, input_dim)。
+               这个 x 应该已经是经过所有嵌入层处理后的 token 特征序列。
+
+        Returns:
+            Bi-LSTM 在每个时间步的输出张量，形状为 (batch_size, sequence_length, output_dim)。
+        """
+        # x shape: (batch_size, sequence_length, input_dim)
+
+        # 应用 dropout 到输入嵌入层
+        x = self.dropout(x)
+
+        # 将处理后的输入序列通过 Bi-LSTM
+        # lstm_out 形状: (batch_size, sequence_length, hidden_dim * 2)
+        # (h_n, c_n) 是 LSTM 的最终隐藏状态和最终细胞状态 (我们在此模型中不使用)
+        lstm_out, (h_n, c_n) = self.lstm(x)
+
+        # lstm_out 的形状是 (batch_size, sequence_length, hidden_dim * 2)
+        # 根据我们的设置 hidden_dim * 2 == output_dim
+        # 所以 lstm_out 的形状是 (batch_size, sequence_length, output_dim)
+
+        # 返回 Bi-LSTM 在每个时间步的输出
+        return lstm_out
+
+
+
+#lstm
+class BertForACEBothOneDropoutSublstm(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_length = config.max_seq_length
+        self.num_labels = config.num_labels
+        self.num_ner_labels = config.num_ner_labels
+        self.num_q_labels = config.num_q_labels
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.ner_classifier = nn.Linear(config.hidden_size*2, self.num_ner_labels)
+        self.re_classifier_m1 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.re_classifier_m2 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.re_classifier_m3 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.q_re_classifier_m1 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+        self.q_re_classifier_m2 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+        self.q_re_classifier_m3 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+
+        self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels-1), dtype=torch.float32)
+        self.ner_alpha = torch.tensor([config.alpha] + [1.0] * (self.num_ner_labels-1), dtype=torch.float32)
+        self.q_alpha = torch.tensor([config.q_alpha] + [1.0] * (self.num_q_labels-1), dtype=torch.float32)
+
+        self.lstm = BiLSTMSequenceFeatureExtractor(input_dim=1536,
+                                       output_dim=1536,
+                                       dropout_rate=0.5)
+
+
+        self.init_weights()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        mentions=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        sub_positions=None,
+        labels=None,
+        ner_labels=None,
+        q_labels=None,
+        q_ner_labels=None,
+        q2_labels=None,
+        q3_labels=None
+    ):
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        seq_len = self.max_seq_length
+        bsz, tot_seq_len = input_ids.shape
+        ent_len = (tot_seq_len-seq_len) // 2
+
+        e1_hidden_states = hidden_states[:, seq_len:seq_len+ent_len]
+        e2_hidden_states = hidden_states[:, seq_len+ent_len: ]
+
+        feature_vector1 = torch.cat([e1_hidden_states, e2_hidden_states], dim=2)
+
+        feature_vector = self.lstm(feature_vector1)
+
+
+
+        ner_prediction_scores = self.ner_classifier(feature_vector)
+
+        # relation_feature
+        r_feature_vector = torch.stack(([feature_vector]*ent_len), dim=2)
+
+
+        # qualifier_feature
+        q_feature_vector = torch.stack(([feature_vector]*ent_len), dim=1)
+        q_ner_prediction_scores = self.ner_classifier(q_feature_vector)
+
+        m1_start_states = hidden_states[torch.arange(bsz), sub_positions[:, 0]]
+        m1_end_states = hidden_states[torch.arange(bsz), sub_positions[:, 1]]
+        m1_states = torch.cat([m1_start_states, m1_end_states], dim=-1)
+
+        # Calculate prediction scores
+        m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
+        m2_scores = self.re_classifier_m2(r_feature_vector) # bsz, ent_len, num_label
+        m3_scores = self.re_classifier_m3(q_feature_vector)
+        re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
+
+        q_m1_scores = self.q_re_classifier_m1(m1_states)  # bsz, num_label
+        q_m2_scores = self.q_re_classifier_m2(r_feature_vector) # bsz, ent_len, num_label
+        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)
+        q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
+
+        outputs = (re_prediction_scores, ner_prediction_scores, q_re_prediction_scores, q_ner_prediction_scores)
+
+        if labels is not None:
+            loss_fct_re = CrossEntropyLoss(ignore_index=-1,  weight=self.alpha.to(re_prediction_scores))
+            loss_fct_ner = CrossEntropyLoss(ignore_index=-1,  weight=self.ner_alpha.to(ner_prediction_scores))
+            loss_fct_q_re = CrossEntropyLoss(ignore_index=-1,  weight=self.q_alpha.to(q_re_prediction_scores))
+
+            re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
+            ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
+            q_re_loss = loss_fct_q_re(q_re_prediction_scores.view(-1, self.num_q_labels), q_labels.view(-1))
+            loss = re_loss + ner_loss + q_re_loss
+            outputs = (loss, re_loss, ner_loss, q_re_loss) + outputs
+
+        return outputs
+
+
+class ONLSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(ONLSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        # 标准LSTM门控结构
+        self.input_gate = nn.Linear(input_size + hidden_size, hidden_size)  # 输入门
+        self.forget_gate = nn.Linear(input_size + hidden_size, hidden_size)  # 遗忘门
+        self.output_gate = nn.Linear(input_size + hidden_size, hidden_size)  # 输出门
+        self.cell_gate = nn.Linear(input_size + hidden_size, hidden_size)  # 候选记忆单元
+        # ON-LSTM特有的主门控
+        self.master_forget_gate = nn.Linear(input_size + hidden_size, hidden_size)  # 主遗忘门
+        self.master_input_gate = nn.Linear(input_size + hidden_size, hidden_size)  # 主输入门
+        # 层归一化
+        self.layer_norm_i = nn.LayerNorm(hidden_size)  # 输入门归一化
+        self.layer_norm_f = nn.LayerNorm(hidden_size)  # 遗忘门归一化
+        self.layer_norm_o = nn.LayerNorm(hidden_size)  # 输出门归一化
+        self.layer_norm_c = nn.LayerNorm(hidden_size)  # 候选记忆单元归一化
+    def cumax(self, x):
+        """累积softmax激活函数，用于实现主门控"""
+        return torch.cumsum(F.softmax(x, dim=-1), dim=-1)  # 沿最后一维计算累积和
+    def forward(self, x, hidden):
+        h_prev, c_prev = hidden  # 前一时间步的隐藏状态和记忆单元
+        combined = torch.cat((x, h_prev), dim=-1)# 拼接当前输入和前一时间步的隐藏状态
+        # 标准LSTM门控计算
+        i = torch.sigmoid(self.layer_norm_i(self.input_gate(combined)))  # 输入门
+        f = torch.sigmoid(self.layer_norm_f(self.forget_gate(combined)))  # 遗忘门
+        o = torch.sigmoid(self.layer_norm_o(self.output_gate(combined)))  # 输出门
+        g = torch.tanh(self.layer_norm_c(self.cell_gate(combined)))  # 候选记忆单元
+        # 主门控计算
+        m_f = self.cumax(self.master_forget_gate(combined))  # 主遗忘门
+        m_i = 1 - self.cumax(self.master_input_gate(combined))  # 主输入门
+        # 用主门控调整标准LSTM门控
+        f = f * m_f  # 调整遗忘门
+        i = i * m_i  # 调整输入门
+        # 更新记忆单元
+        c_t = f * c_prev + i * g
+        # 更新隐藏状态
+        h_t = o * torch.tanh(c_t)
+        return h_t, c_t
+
+class ONLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1, bidirectional=False, dropout=0.0):
+        super(ONLSTM, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.dropout = dropout
+        # 创建多层ONLSTM单元
+        self.onlstm_cells = nn.ModuleList([ONLSTMCell(input_size, hidden_size) if i == 0
+                                           else ONLSTMCell(hidden_size, hidden_size)
+                                           for i in range(num_layers)])
+        # 如果是双向LSTM，创建反向层
+        if bidirectional:
+            self.onlstm_cells_reverse = nn.ModuleList([ONLSTMCell(input_size, hidden_size) if i == 0
+                                                       else ONLSTMCell(hidden_size, hidden_size)
+                                                       for i in range(num_layers)])
+        # self.dropout_layer = nn.Dropout(dropout)  # dropout层
+    def forward(self, x):
+        batch_size, seq_length, _ = x.size()  # 获取输入维度
+        # 初始化隐藏状态和记忆单元（正向）
+        h_t = [torch.zeros(batch_size, self.hidden_size).to(x.device) for _ in range(self.num_layers)]
+        c_t = [torch.zeros(batch_size, self.hidden_size).to(x.device) for _ in range(self.num_layers)]
+
+        # 如果是双向LSTM，初始化反向的隐藏状态和记忆单元
+        if self.bidirectional:
+            h_t_reverse = [torch.zeros(batch_size, self.hidden_size).to(x.device) for _ in range(self.num_layers)]
+            c_t_reverse = [torch.zeros(batch_size, self.hidden_size).to(x.device) for _ in range(self.num_layers)]
+
+        outputs = []  # 正向输出
+        outputs_reverse = []  # 反向输出
+
+        # 正向传播
+        for t in range(seq_length):
+            for i, onlstm_cell in enumerate(self.onlstm_cells):
+                if i == 0:  # 第一层使用输入x
+                    h_t[i], c_t[i] = onlstm_cell(x[:, t, :], (h_t[i], c_t[i]))
+                else:  # 后续层使用前一层的输出
+                    h_t[i], c_t[i] = onlstm_cell(h_t[i - 1], (h_t[i], c_t[i]))
+            outputs.append(h_t[-1])  # 保存最后一层的输出
+
+        # 如果是双向LSTM，进行反向传播
+        if self.bidirectional:
+            for t in range(seq_length - 1, -1, -1):  # 反向遍历时间步
+                for i, onlstm_cell in enumerate(self.onlstm_cells_reverse):
+                    if i == 0:
+                        h_t_reverse[i], c_t_reverse[i] = onlstm_cell(x[:, t, :], (h_t_reverse[i], c_t_reverse[i]))
+                    else:
+                        h_t_reverse[i], c_t_reverse[i] = onlstm_cell(h_t_reverse[i - 1],
+                                                                     (h_t_reverse[i], c_t_reverse[i]))
+                outputs_reverse.append(h_t_reverse[-1])
+        # 堆叠所有时间步的输出
+        outputs = torch.stack(outputs, dim=1)
+        if self.bidirectional:
+            outputs_reverse = torch.stack(outputs_reverse[::-1], dim=1)  # 反转反向输出使其与正向对齐
+            outputs = torch.cat((outputs, outputs_reverse), dim=-1)  # 拼接正向和反向输出
+        # 应用dropout
+        # outputs = self.dropout_layer(outputs)
+
+        # 返回所有时间步的输出和最后一个时间步的隐藏状态
+        return outputs, (h_t[-1], c_t[-1])
+
+
+class OptimizedONLSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(OptimizedONLSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        # 合并所有门控的线性变换以减少矩阵乘法次数
+        self.gates_linear = nn.Linear(input_size + hidden_size, 4 * hidden_size)
+        self.master_gates_linear = nn.Linear(input_size + hidden_size, 2 * hidden_size)
+
+        # 层归一化
+        self.layer_norm = nn.ModuleList([
+            nn.LayerNorm(hidden_size) for _ in range(4)
+        ])
+    def cumax(self, x):
+        return torch.cumsum(F.softmax(x, dim=-1), dim=-1)
+    def forward(self, x, hidden):
+        h_prev, c_prev = hidden # 前一个时间步的隐藏状态和记忆单元
+        # 合并所有输入拼接操作
+        combined = torch.cat((x, h_prev), dim=-1)
+        # 一次性计算所有标准门控
+        gates = self.gates_linear(combined)
+        i, f, o, g = gates.chunk(4, dim=-1)
+        # 应用层归一化和激活函数
+        i = torch.sigmoid(self.layer_norm[0](i))
+        f = torch.sigmoid(self.layer_norm[1](f))
+        o = torch.sigmoid(self.layer_norm[2](o))
+        g = torch.tanh(self.layer_norm[3](g))
+        # 计算主遗忘门和主输入门
+        master_gates = self.master_gates_linear(combined)
+        m_f, m_i = master_gates.chunk(2, dim=-1)
+        # 使用 cumax 确保单调性
+        m_f = self.cumax(m_f)  # 主遗忘门（0 → 1）
+        m_i = 1 - self.cumax(m_i)  # 主输入门（1 → 0）
+        # 用主门控调整标准门控
+        f = f * m_f  # 遗忘门受主遗忘门约束
+        i = i * m_i  # 输入门受主输入门约束
+        # 更新记忆单元和隐藏状态
+        c_t = f * c_prev + i * g
+        h_t = o * torch.tanh(c_t)
+
+        return h_t, c_t
+class OptimizedONLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1, bidirectional=False, dropout=0.0):
+        super(OptimizedONLSTM, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+
+        self.onlstm_cells = nn.ModuleList([
+            OptimizedONLSTMCell(
+                input_size if i == 0 else hidden_size,
+                hidden_size
+            ) for i in range(num_layers)
+        ])
+
+        if bidirectional:
+            self.onlstm_cells_reverse = nn.ModuleList([
+                OptimizedONLSTMCell(
+                    input_size if i == 0 else hidden_size,
+                    hidden_size
+                ) for i in range(num_layers)
+            ])
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, hidden=None):
+        batch_size, seq_len, _ = x.size()
+        device = x.device
+
+        # 初始化隐藏状态 - 确保每次都创建新的张量
+        if hidden is None:
+            num_directions = 2 if self.bidirectional else 1
+            h = [torch.zeros(batch_size, self.hidden_size, device=device)
+                 for _ in range(self.num_layers * num_directions)]
+            c = [torch.zeros(batch_size, self.hidden_size, device=device)
+                 for _ in range(self.num_layers * num_directions)]
+        else:
+            # 确保不修改原始hidden状态
+            h, c = hidden
+            h = [h_layer.clone() for h_layer in h]
+            c = [c_layer.clone() for c_layer in c]
+
+        # 处理正向和反向
+        outputs = []
+        for direction in ([0] if not self.bidirectional else [0, 1]):
+            layer_outputs = []
+            for t in range(seq_len) if direction == 0 else range(seq_len - 1, -1, -1):
+                input_data = x[:, t, :]  # 获取当前时间步的输入
+                for layer in range(self.num_layers):
+                    # 选择正向或反向的 Cell
+                    cell = self.onlstm_cells[layer] if direction == 0 else self.onlstm_cells_reverse[layer]
+                    h_idx = layer * 2 + direction if self.bidirectional else layer
+                    # 计算新的隐藏状态和记忆单元
+                    new_h, new_c = cell(input_data, (h[h_idx], c[h_idx]))
+                    h[h_idx] = new_h
+                    c[h_idx] = new_c
+                    input_data = new_h  # 下一层的输入是当前层的输出
+                layer_outputs.append(input_data)  # 记录当前时间步的输出
+
+            if direction == 1:
+                layer_outputs = layer_outputs[::-1]  # 反向序列需要反转
+            outputs.append(torch.stack(layer_outputs, dim=1))  # 堆叠成 (batch_size, seq_len, hidden_size)
+
+        # 合并输出
+        output = torch.cat(outputs, dim=-1) if self.bidirectional else outputs[0]
+        output = self.dropout(output)
+
+        # 将h和c转换为元组
+        h = torch.stack(h, dim=0)
+        c = torch.stack(c, dim=0)
+
+        return output, (h, c)
+
+class BertForACEBothOneDropoutSub1(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_length = config.max_seq_length
+        self.num_labels = config.num_labels
+        self.num_ner_labels = config.num_ner_labels
+        self.num_q_labels = config.num_q_labels
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.ner_classifier = nn.Linear(config.hidden_size*2, self.num_ner_labels)
+        self.re_classifier_m1 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.re_classifier_m2 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.re_classifier_m3 = nn.Linear(config.hidden_size*2, self.num_labels)
+        self.q_re_classifier_m1 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+        self.q_re_classifier_m2 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+        self.q_re_classifier_m3 = nn.Linear(config.hidden_size*2, self.num_q_labels)
+
+        self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels-1), dtype=torch.float32)
+        self.ner_alpha = torch.tensor([config.alpha] + [1.0] * (self.num_ner_labels-1), dtype=torch.float32)
+        self.q_alpha = torch.tensor([config.q_alpha] + [1.0] * (self.num_q_labels-1), dtype=torch.float32)
+
+        self.onlstm = OptimizedONLSTM(1536, 768, 2, True, 0.2)
+        self.hope = HOPE_Adapted(total_dim=1536, num_heads=32, max_seq_len=1024, train_seq_len=512)
+
+
+
+
+
+        self.init_weights()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        mentions=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        sub_positions=None,
+        labels=None,
+        ner_labels=None,
+        q_labels=None,
+        q_ner_labels=None,
+        q2_labels=None,
+        q3_labels=None
+    ):
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        seq_len = self.max_seq_length
+        bsz, tot_seq_len = input_ids.shape
+        ent_len = (tot_seq_len-seq_len) // 2
+
+
+
+        e1_hidden_states = hidden_states[:, seq_len:seq_len+ent_len]
+        e2_hidden_states = hidden_states[:, seq_len+ent_len: ]
+
+        feature_vector1 = torch.cat([e1_hidden_states, e2_hidden_states], dim=2)
+
+        feature_vector2, (final_hidden, final_cell)  = self.onlstm(feature_vector1)
+
+        feature_vector3 = self.hope(feature_vector1)
+
+        feature_vector = feature_vector1 + feature_vector2 + feature_vector3
+
+        ner_prediction_scores = self.ner_classifier(feature_vector)
+
+        # relation_feature
+        r_feature_vector = torch.stack(([feature_vector]*ent_len), dim=2)
+
+
+        # qualifier_feature
+        q_feature_vector = torch.stack(([feature_vector]*ent_len), dim=1)
+        q_ner_prediction_scores = self.ner_classifier(q_feature_vector)
+
+        m1_start_states = hidden_states[torch.arange(bsz), sub_positions[:, 0]]
+        m1_end_states = hidden_states[torch.arange(bsz), sub_positions[:, 1]]
+        m1_states = torch.cat([m1_start_states, m1_end_states], dim=-1)
+
+        # Calculate prediction scores
+        m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
+        m2_scores = self.re_classifier_m2(r_feature_vector) # bsz, ent_len, num_label
+        m3_scores = self.re_classifier_m3(q_feature_vector)
+        re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
+
+        q_m1_scores = self.q_re_classifier_m1(m1_states)  # bsz, num_label
+        q_m2_scores = self.q_re_classifier_m2(r_feature_vector) # bsz, ent_len, num_label
+        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)
+        q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
+
+        outputs = (re_prediction_scores, ner_prediction_scores, q_re_prediction_scores, q_ner_prediction_scores)
+
+        if labels is not None:
+            loss_fct_re = CrossEntropyLoss(ignore_index=-1,  weight=self.alpha.to(re_prediction_scores))
+            loss_fct_ner = CrossEntropyLoss(ignore_index=-1,  weight=self.ner_alpha.to(ner_prediction_scores))
+            loss_fct_q_re = CrossEntropyLoss(ignore_index=-1,  weight=self.q_alpha.to(q_re_prediction_scores))
+
+            re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
+            ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
+            q_re_loss = loss_fct_q_re(q_re_prediction_scores.view(-1, self.num_q_labels), q_labels.view(-1))
+            loss = re_loss + ner_loss + q_re_loss
+            outputs = (loss, re_loss, ner_loss, q_re_loss) + outputs
+
+        return outputs
+
+
+class BertForACEBothOneDropoutSub(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_length = config.max_seq_length
+        self.num_labels = config.num_labels
+        self.num_ner_labels = config.num_ner_labels
+        self.num_q_labels = config.num_q_labels
+
+        # 对比学习相关参数
+        # self.temperature = config.temperature if hasattr(config, 'temperature') else 0.2
+
+        self.log_temperature = torch.nn.Parameter(torch.tensor(0.0))
+
+        self.contrastive_loss_weight = 0.2
+        self.projection_dim = 128
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # 原始分类器
         self.ner_classifier = nn.Linear(config.hidden_size * 2, self.num_ner_labels)
         self.re_classifier_m1 = nn.Linear(config.hidden_size * 2, self.num_labels)
         self.re_classifier_m2 = nn.Linear(config.hidden_size * 2, self.num_labels)
@@ -2382,18 +2945,219 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         self.q_re_classifier_m2 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
         self.q_re_classifier_m3 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
 
+        # 对比学习投影头
+        self.contrastive_projection = nn.Sequential(
+            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, self.projection_dim)
+        )
+
         self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels - 1), dtype=torch.float32)
         self.ner_alpha = torch.tensor([config.alpha] + [1.0] * (self.num_ner_labels - 1), dtype=torch.float32)
         self.q_alpha = torch.tensor([config.q_alpha] + [1.0] * (self.num_q_labels - 1), dtype=torch.float32)
 
+        self.onlstm = OptimizedONLSTM(2048, 1024, 2, True, 0.2)
+        self.hope = HOPE_Adapted(total_dim=2048, num_heads=32, max_seq_len=1024, train_seq_len=512)
+
+        self.feature_self_attn = nn.MultiheadAttention(
+            embed_dim=config.hidden_size * 2,  # 1536
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_probs_dropout_prob
+        )
+        self.feature_attn_layer_norm = nn.LayerNorm(config.hidden_size * 2)
+
         self.init_weights()
 
-        self.posi= PosiNet(config.hidden_size * 2, 32)
-        self.qia = qiaAttention(d_model=config.hidden_size * 2, d_k=config.hidden_size * 2, d_v=config.hidden_size * 2, h=8)
 
-        self.fc = nn.Linear(config.hidden_size * 2 * 2, config.hidden_size * 2)
+    def compute_contrastive_loss2(self, features, relation_labels):
+
+        batch_size, num_entities, _ = features.shape
+        features = F.normalize(features, dim=-1)
+        # 初始化对比损失
+        total_contrastive_loss = 0.0
+        valid_pairs = 0
+        for i in range(batch_size):
+            # 获取当前batch的实体特征和关系标签
+            batch_features = features[i]
+            batch_labels = relation_labels[i]
+            # 计算相似度矩阵
+            sim_matrix = torch.matmul(batch_features, batch_features.T) / self.temperature
+            # 正样本: 存在关系的实体对
+            positive_mask = (batch_labels > 0).float()
+            positive_mask.fill_diagonal_(0)
+            # 负样本: 无关系的实体对
+            negative_mask = (batch_labels == 0).float()
+            negative_mask.fill_diagonal_(0)
+            # 计算对比损失
+            exp_sim = torch.exp(sim_matrix)
+            # 正样本相似度
+            positive_sim = torch.sum(exp_sim * positive_mask, dim=1)
+            # 负样本相似度
+            negative_sim = torch.sum(exp_sim * negative_mask, dim=1)
+            valid_mask = (positive_sim > 0) & (negative_sim > 0)
+            if valid_mask.any():
+                contrastive_loss = -torch.log(
+                    positive_sim[valid_mask] / (positive_sim[valid_mask] + negative_sim[valid_mask])
+                ).mean()
+                total_contrastive_loss += contrastive_loss
+                valid_pairs += 1
+        if valid_pairs > 0:
+            return total_contrastive_loss / valid_pairs
+        else:
+            return torch.tensor(0.0, device=features.device)
+
+    def compute_contrastive_loss(self, features, relation_labels):
+        batch_size, num_entities, _ = features.shape
+        features = F.normalize(features, dim=-1)
+
+        # 向量化计算相似度矩阵
+        temperature = torch.exp(self.log_temperature)
+        sim_matrix = torch.einsum('bik,bjk->bij', features, features) / temperature
+
+        # 创建正负样本掩码
+        positive_mask = (relation_labels > 0).float()
+        negative_mask = (relation_labels == 0).float()
+
+        eye_mask = 1 - torch.eye(num_entities, device=features.device).unsqueeze(0)
+        positive_mask = positive_mask * eye_mask
+        negative_mask = negative_mask * eye_mask
+
+        # 计算指数相似度
+        exp_sim = torch.exp(sim_matrix)
+
+        # 计算正负样本相似度和 [batch_size, num_entities]
+        positive_sim = torch.sum(exp_sim * positive_mask, dim=-1)
+        negative_sim = torch.sum(exp_sim * negative_mask, dim=-1)
+
+        # 计算有效样本
+        valid_mask = (positive_sim > 0) & (negative_sim > 0)
+
+        if valid_mask.any():
+            contrastive_loss = -torch.log(
+                positive_sim[valid_mask] / (positive_sim[valid_mask] + negative_sim[valid_mask])
+            ).mean()
+            return contrastive_loss
+        return torch.tensor(0.0, device=features.device)
+
+    def forward(self, input_ids=None, attention_mask=None, mentions=None, token_type_ids=None,
+                position_ids=None, head_mask=None, inputs_embeds=None, sub_positions=None,
+                labels=None, ner_labels=None, q_labels=None, q_ner_labels=None,
+                q2_labels=None, q3_labels=None):
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        seq_len = self.max_seq_length
+        bsz, tot_seq_len = input_ids.shape
+        ent_len = (tot_seq_len - seq_len) // 2
+
+        e1_hidden_states = hidden_states[:, seq_len:seq_len + ent_len]
+        e2_hidden_states = hidden_states[:, seq_len + ent_len:]
+        feature_vector1 = torch.cat([e1_hidden_states, e2_hidden_states], dim=2)
+
+        attn_output, _ = self.feature_self_attn(
+            feature_vector1, feature_vector1, feature_vector1
+        )
+
+        feature_vector2, (final_hidden, final_cell) = self.onlstm(feature_vector1)
+
+        feature_vector3 = self.hope(feature_vector1)
+
+        feature_vector = feature_vector3 + feature_vector1 + feature_vector2
+        feature_vector = self.feature_attn_layer_norm(feature_vector)
+
+        # 对比学习投影
+        contrastive_features = self.contrastive_projection(feature_vector)
+
+        ner_prediction_scores = self.ner_classifier(feature_vector)
+        r_feature_vector = torch.stack(([feature_vector] * ent_len), dim=2)
+        q_feature_vector = torch.stack(([feature_vector] * ent_len), dim=1)
+        q_ner_prediction_scores = self.ner_classifier(q_feature_vector)
+
+        m1_start_states = hidden_states[torch.arange(bsz), sub_positions[:, 0]]
+        m1_end_states = hidden_states[torch.arange(bsz), sub_positions[:, 1]]
+        m1_states = torch.cat([m1_start_states, m1_end_states], dim=-1)
+
+        m1_scores = self.re_classifier_m1(m1_states)
+        m2_scores = self.re_classifier_m2(r_feature_vector)
+        m3_scores = self.re_classifier_m3(q_feature_vector)
+        re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
+
+        q_m1_scores = self.q_re_classifier_m1(m1_states)
+        q_m2_scores = self.q_re_classifier_m2(r_feature_vector)
+        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)
+        q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
+
+        outputs = (re_prediction_scores, ner_prediction_scores, q_re_prediction_scores, q_ner_prediction_scores)
 
 
+
+        if labels is not None:
+            loss_fct_re = CrossEntropyLoss(ignore_index=-1, weight=self.alpha.to(re_prediction_scores))
+            loss_fct_ner = CrossEntropyLoss(ignore_index=-1, weight=self.ner_alpha.to(ner_prediction_scores))
+            loss_fct_q_re = CrossEntropyLoss(ignore_index=-1, weight=self.q_alpha.to(q_re_prediction_scores))
+
+            re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
+            ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
+            q_re_loss = loss_fct_q_re(q_re_prediction_scores.view(-1, self.num_q_labels), q_labels.view(-1))
+
+            # 计算对比损失
+            contrastive_loss = self.compute_contrastive_loss(
+                contrastive_features,
+                labels.float()
+            )
+            contrastive_loss2 = self.compute_contrastive_loss(
+                contrastive_features,
+                q_labels.float()
+            )
+            # 总损失 = 原始损失 + 对比损失权重 * 对比损失
+            loss = re_loss + ner_loss + q_re_loss + self.contrastive_loss_weight * (contrastive_loss + contrastive_loss2)
+            outputs = (loss, re_loss, ner_loss, q_re_loss, contrastive_loss) + outputs
+
+        return outputs
+
+
+#卷积加注意力
+class BertForACEBothOneDropoutSub_hinge(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_length = config.max_seq_length
+        self.num_labels = config.num_labels
+        self.num_ner_labels = config.num_ner_labels
+        self.num_q_labels = config.num_q_labels
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # 原有的分类器保持不变
+        self.ner_classifier = nn.Linear(config.hidden_size * 2, self.num_ner_labels)
+        self.re_classifier_m1 = nn.Linear(config.hidden_size * 2, self.num_labels)
+        self.re_classifier_m2 = nn.Linear(config.hidden_size * 2, self.num_labels)
+        self.re_classifier_m3 = nn.Linear(config.hidden_size * 2, self.num_labels)
+        self.q_re_classifier_m1 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
+        self.q_re_classifier_m2 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
+        self.q_re_classifier_m3 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
+
+        # 新增的卷积层，确保输入和输出维度相同
+        self.conv_triple = nn.Conv1d(in_channels=config.hidden_size * 2, out_channels=config.hidden_size * 2,
+                                     kernel_size=3, padding=1)
+        self.conv_quintuple = nn.Conv1d(in_channels=config.hidden_size * 2, out_channels=config.hidden_size * 2,
+                                        kernel_size=5, padding=2)
+
+        # 类别权重
+        self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels - 1), dtype=torch.float32)
+        self.ner_alpha = torch.tensor([config.alpha] + [1.0] * (self.num_ner_labels - 1), dtype=torch.float32)
+        self.q_alpha = torch.tensor([config.q_alpha] + [1.0] * (self.num_q_labels - 1), dtype=torch.float32)
+        self.attention = nn.MultiheadAttention(embed_dim=config.hidden_size * 2, num_heads=8,
+                                                dropout=config.hidden_dropout_prob)
+
+        self.init_weights()
 
     def forward(
             self,
@@ -2412,6 +3176,7 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
             q2_labels=None,
             q3_labels=None
     ):
+        # 原有的 Bert 模型输出
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
@@ -2429,49 +3194,53 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         e1_hidden_states = hidden_states[:, seq_len:seq_len + ent_len]
         e2_hidden_states = hidden_states[:, seq_len + ent_len:]
 
-        feature_vector1 = torch.cat([e1_hidden_states, e2_hidden_states], dim=2)
+        # 原有的特征拼接
+        feature_vector = torch.cat([e1_hidden_states, e2_hidden_states], dim=2)  # (bsz, ent_len, hidden_size*2)
+        # 应用注意力机制
+        feature_vector_transposed = feature_vector.permute(1, 0, 2)  # (ent_len, bsz, hidden_size*2)
+        attn_output, attn_weights = self.attention(feature_vector_transposed, feature_vector_transposed,feature_vector_transposed)
+        attn_output = attn_output.permute(1, 0, 2)
+        enhanced_feature_vector = feature_vector + attn_output
 
-        feature_vector2 = self.posi(feature_vector1)
-        feature_vector3 = self.qia(feature_vector1, feature_vector1, feature_vector1)
-
-        # Combine feature vectors with weights
-        feature_vector = torch.cat([feature_vector2, feature_vector3], dim=-1)
-        feature_vector = self.fc(feature_vector)
-
-
-        ner_prediction_scores = self.ner_classifier(feature_vector)
-
-        # relation_feature
-        r_feature_vector = torch.stack(([feature_vector] * ent_len), dim=2)
-
-        # qualifier_feature
-        q_feature_vector = torch.stack(([feature_vector] * ent_len), dim=1)
+        # 先调整维度以适应 Conv1d 操作：将 (batch_size, seq_len, hidden_size*2) -> (batch_size, hidden_size*2, seq_len)
+        conv_input = enhanced_feature_vector.permute(0, 2, 1)
+        # 卷积操作
+        triple_feature = F.relu(self.conv_triple(conv_input))  # (bsz, hidden_size*2, seq_len)
+        quintuple_feature = F.relu(self.conv_quintuple(conv_input))  # (bsz, hidden_size*2, seq_len)
+        # 调整回原始维度：将 (batch_size, hidden_size*2, seq_len) -> (batch_size, seq_len, hidden_size*2)
+        triple_feature = triple_feature.permute(0, 2, 1)
+        quintuple_feature = quintuple_feature.permute(0, 2, 1)
+        # 最小相关性融合
+        final_feature = torch.min(triple_feature, quintuple_feature)
+        ner_prediction_scores = self.ner_classifier(final_feature)
+        r_feature_vector = torch.stack(([final_feature] * ent_len), dim=2)
+        q_feature_vector = torch.stack(([final_feature] * ent_len), dim=1)
         q_ner_prediction_scores = self.ner_classifier(q_feature_vector)
 
+        # 提取 mention 的特征
         m1_start_states = hidden_states[torch.arange(bsz), sub_positions[:, 0]]
         m1_end_states = hidden_states[torch.arange(bsz), sub_positions[:, 1]]
         m1_states = torch.cat([m1_start_states, m1_end_states], dim=-1)
 
-
-
-
-        # Calculate prediction scores
+        # 计算预测分数
         m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
         m2_scores = self.re_classifier_m2(r_feature_vector)  # bsz, ent_len, num_label
-        m3_scores = self.re_classifier_m3(q_feature_vector)
+        m3_scores = self.re_classifier_m3(q_feature_vector)  # bsz, ent_len, num_label
         re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
 
         q_m1_scores = self.q_re_classifier_m1(m1_states)  # bsz, num_label
         q_m2_scores = self.q_re_classifier_m2(r_feature_vector)  # bsz, ent_len, num_label
-        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)
+        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)  # bsz, ent_len, num_label
         q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
 
         outputs = (re_prediction_scores, ner_prediction_scores, q_re_prediction_scores, q_ner_prediction_scores)
 
+        # 如果有标签，计算损失
         if labels is not None:
             loss_fct_re = CrossEntropyLoss(ignore_index=-1, weight=self.alpha.to(re_prediction_scores))
             loss_fct_ner = CrossEntropyLoss(ignore_index=-1, weight=self.ner_alpha.to(ner_prediction_scores))
             loss_fct_q_re = CrossEntropyLoss(ignore_index=-1, weight=self.q_alpha.to(q_re_prediction_scores))
+
             re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
             ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
             q_re_loss = loss_fct_q_re(q_re_prediction_scores.view(-1, self.num_q_labels), q_labels.view(-1))
@@ -2480,11 +3249,140 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
         return outputs
 
+#加卷积2，52，分开加的，87.1
+class BertForACEBothOneDropoutSub333333(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_length = config.max_seq_length
+        self.num_labels = config.num_labels
+        self.num_ner_labels = config.num_ner_labels
+        self.num_q_labels = config.num_q_labels
+
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # 原有的分类器保持不变
+        self.ner_classifier = nn.Linear(config.hidden_size * 2, self.num_ner_labels)
+        self.re_classifier_m1 = nn.Linear(config.hidden_size * 2, self.num_labels)
+        self.re_classifier_m2 = nn.Linear(config.hidden_size * 2, self.num_labels)
+        self.re_classifier_m3 = nn.Linear(config.hidden_size * 2, self.num_labels)
+        self.q_re_classifier_m1 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
+        self.q_re_classifier_m2 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
+        self.q_re_classifier_m3 = nn.Linear(config.hidden_size * 2, self.num_q_labels)
 
 
+        self.conv_quintuple = nn.Conv1d(in_channels=config.hidden_size * 2, out_channels=config.hidden_size * 2,
+                                        kernel_size=3, padding=1)
+        #自注意力层
+        self.attention = nn.MultiheadAttention(embed_dim=config.hidden_size * 2, num_heads=8,
+                                               dropout=config.hidden_dropout_prob)
+        # 类别权重
+        self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels - 1), dtype=torch.float32)
+        self.ner_alpha = torch.tensor([config.alpha] + [1.0] * (self.num_ner_labels - 1), dtype=torch.float32)
+        self.q_alpha = torch.tensor([config.q_alpha] + [1.0] * (self.num_q_labels - 1), dtype=torch.float32)
+        self.init_weights()
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            mentions=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            sub_positions=None,
+            labels=None,
+            ner_labels=None,
+            q_labels=None,
+            q_ner_labels=None,
+            q2_labels=None,
+            q3_labels=None
+    ):
+        # 原有的 Bert 模型输出
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        seq_len = self.max_seq_length
+        bsz, tot_seq_len = input_ids.shape
+        ent_len = (tot_seq_len - seq_len) // 2
+
+        e1_hidden_states = hidden_states[:, seq_len:seq_len + ent_len]
+        e2_hidden_states = hidden_states[:, seq_len + ent_len:]
+
+        # 原有的特征
+        feature_vector = torch.cat([e1_hidden_states, e2_hidden_states], dim=2) # (bsz, ent_len, hidden_size*2)
+
+        conv_input = feature_vector.permute(0, 2, 1)  # Rearrange dimensions for convolution
+        conv_output = F.relu(self.conv_quintuple(conv_input))  # Apply convolution and ReLU activation
+        feature_vector_transposed = conv_output.permute(2, 0, 1)  # (ent_len, bsz, hidden_size*2)
+        attn_output, attn_weights = self.attention(feature_vector_transposed, feature_vector_transposed, feature_vector_transposed)
+        attn_output = attn_output.permute(1, 0, 2)
+        feature_vector_updated = feature_vector + attn_output
 
 
+        # # 卷积操作
+        # triple_feature = F.relu(self.conv_triple(conv_input))  # (bsz, hidden_size*2, seq_len)
+        # quintuple_feature = F.relu(self.conv_quintuple(conv_input))  # (bsz, hidden_size*2, seq_len)
+        # triple_feature1 = triple_feature.permute(0, 2, 1)
+        # triple_feature2 = triple_feature1.permute(1, 0, 2)
+        # triple_feature3, triple_weights = self.attention(triple_feature2, triple_feature2, triple_feature2)
+        # triple_feature3 = triple_feature3.permute(1, 0, 2)
+        # triple_feature = triple_feature3 + feature_vector
+        # # quintuple_feature注意力
+        # quintuple_feature1 = quintuple_feature.permute(0, 2, 1)
+        # quintuple_feature2 = quintuple_feature1.permute(1, 0, 2)
+        # quintuple_feature3, triple_weights = self.attention(quintuple_feature2, quintuple_feature2, quintuple_feature2)
+        # quintuple_feature3 = quintuple_feature3.permute(1, 0, 2)
+        # quintuple_feature = quintuple_feature3 + feature_vector
 
+        # NER预测
+        ner_prediction_scores = self.ner_classifier(feature_vector_updated)
+        # relation_feature
+        r_feature_vector = torch.stack(([feature_vector_updated] * ent_len), dim=2)
+        # qualifier_feature
+        q_feature_vector = torch.stack(([feature_vector_updated] * ent_len), dim=1)
+
+        q_ner_prediction_scores = self.ner_classifier(q_feature_vector)
+
+        # 提取 mention 的特征
+        m1_start_states = hidden_states[torch.arange(bsz), sub_positions[:, 0]]
+        m1_end_states = hidden_states[torch.arange(bsz), sub_positions[:, 1]]
+        m1_states = torch.cat([m1_start_states, m1_end_states], dim=-1)
+
+        # 计算预测分数
+        m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
+        m2_scores = self.re_classifier_m2(r_feature_vector)  # bsz, ent_len, num_label
+        m3_scores = self.re_classifier_m3(q_feature_vector)  # bsz, ent_len, num_label
+        re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
+
+        q_m1_scores = self.q_re_classifier_m1(m1_states)  # bsz, num_label
+        q_m2_scores = self.q_re_classifier_m2(r_feature_vector)  # bsz, ent_len, num_label
+        q_m3_scores = self.q_re_classifier_m3(q_feature_vector)  # bsz, ent_len, num_label
+        q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
+
+        outputs = (re_prediction_scores, ner_prediction_scores, q_re_prediction_scores, q_ner_prediction_scores)
+
+        # 如果有标签，计算损失
+        if labels is not None:
+            loss_fct_re = CrossEntropyLoss(ignore_index=-1, weight=self.alpha.to(re_prediction_scores))
+            loss_fct_ner = CrossEntropyLoss(ignore_index=-1, weight=self.ner_alpha.to(ner_prediction_scores))
+            loss_fct_q_re = CrossEntropyLoss(ignore_index=-1, weight=self.q_alpha.to(q_re_prediction_scores))
+
+            re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
+            ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
+            q_re_loss = loss_fct_q_re(q_re_prediction_scores.view(-1, self.num_q_labels), q_labels.view(-1))
+            loss = re_loss + ner_loss + q_re_loss
+            outputs = (loss, re_loss, ner_loss, q_re_loss) + outputs
+
+        return outputs
 
 
 
@@ -2565,9 +3463,6 @@ class BertForACEBothOneDropoutLeviPair(BertPreTrainedModel):
             outputs = (loss, re_loss, m1_ner_loss+m2_ner_loss) + outputs
 
         return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
-
-
-
 
 class BertForACEBothOneDropout(BertPreTrainedModel):
     def __init__(self, config):
